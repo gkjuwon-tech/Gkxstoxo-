@@ -29,6 +29,17 @@ before video encoding (max difference 0), so loop closure holds by
 construction. Holes peak at 0.32% of a frame, all from the masked watermark.
 The CPU renderer takes about 3 s per 1920x1072 frame.
 
+## Prompt rules learned
+
+- **Boundary rule.** Anything the canvas cuts at the gray boundary (rugs, floor,
+  furniture, walls) must be named in the prompt as continuing into the gray.
+  Never ask for new walls or furniture where an existing object runs into the gray.
+  Shard 02 v1 broke this: the prompt asked for a desk wall where the runner rug
+  continued, so the model laid the rug under a wall
+  (`shards/rejected/shard02_raw_v1_rug_under_wall.png`).
+- **Resolution.** Upload the model output at full resolution. Shard 02 v1 came
+  back at 1024 px wide against 2752 px for earlier shards.
+
 ## Assumptions
 
 - 24mm lens on a 36mm-wide sensor, so a horizontal field of view of about 74 degrees.
