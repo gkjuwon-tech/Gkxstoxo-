@@ -38,8 +38,6 @@ def yaw_matrix(deg):
 
 def push_pull_fill(rgb, valid, levels=8):
     """rgb: [3,H,W], valid: [H,W] bool. Fills invalid pixels from valid neighbours."""
-    if bool(valid.all()):
-        return rgb
     w = valid.float()[None, None]
     a = (rgb[None] * w)
     pyr = [(a, w)]
@@ -67,6 +65,7 @@ class ShardWorld:
         self.Ks = intrinsics(self.sw, self.sh, focal_mm).to(device)
         # world -> shard camera for every shard: R(syaw)^T
         self.Rs = torch.stack([yaw_matrix(y).T for y in yaws]).to(device)
+        self.yaws = list(yaws)
         self.focal_mm = focal_mm
         self._rays = {}
 
@@ -80,29 +79,47 @@ class ShardWorld:
             self._rays[key] = pix @ torch.linalg.inv(Ko).T
         return self._rays[key]
 
+    def _half_diag(self, w, h, K):
+        return math.atan(math.hypot(w, h) / 2 / float(K[0, 0]))
+
+    def visible(self, yaw, ow, oh):
+        """Indices of shards whose frustum can overlap a camera at `yaw` (pure yaw only)."""
+        Ko = intrinsics(ow, oh, self.focal_mm)
+        reach = self._half_diag(ow, oh, Ko) + self._half_diag(self.sw, self.sh, self.Ks.cpu())
+        out = []
+        for i, sy in enumerate(self.yaws):
+            d = abs((yaw - sy + 180.0) % 360.0 - 180.0)
+            if math.radians(d) < reach:
+                out.append(i)
+        return out
+
     @torch.no_grad()
     def render(self, yaw, ow, oh, fill=True):
         """Returns ([3,oh,ow] float 0..1, [oh,ow] bool known)."""
-        world = self.rays(ow, oh) @ yaw_matrix(yaw).to(self.device).T          # [oh,ow,3]
-        local = torch.einsum("hwc,ndc->nhwd", world, self.Rs)                  # [N,oh,ow,3]
-        p = local @ self.Ks.T
-        z = p[..., 2]
-        front = z > 1e-6
-        zs = torch.where(front, z, torch.ones_like(z))
-        gx = (p[..., 0] / zs) / self.sw * 2 - 1
-        gy = (p[..., 1] / zs) / self.sh * 2 - 1
-        grid = torch.stack([gx, gy], -1)
-        grid = torch.where(front[..., None], grid, torch.full_like(grid, 3.0))
-        samp = F.grid_sample(self.tex, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-        ok = samp[:, 3] > 0.5                                                   # [N,oh,ow]
-        rgb = samp[:, :3] / samp[:, 3:4].clamp_min(1e-6)                       # un-premultiply edge blend
-        # later shards win: take the last valid index per pixel
-        idx = torch.arange(self.n, device=self.device)[:, None, None].expand_as(ok)
-        last = torch.where(ok, idx, torch.full_like(idx, -1)).amax(0)          # [oh,ow]
-        known = last >= 0
-        gather = last.clamp_min(0)[None, None].expand(1, 3, oh, ow)
-        out = torch.gather(rgb.permute(1, 0, 2, 3), 1, gather.permute(1, 0, 2, 3)).squeeze(1)
-        out = torch.where(known[None], out, torch.zeros_like(out))
+        idx = self.visible(yaw, ow, oh)
+        out = torch.zeros(3, oh, ow, device=self.device)
+        known = torch.zeros(oh, ow, dtype=torch.bool, device=self.device)
+        if idx:
+            sel = torch.tensor(idx, device=self.device)
+            world = self.rays(ow, oh) @ yaw_matrix(yaw).to(self.device).T      # [oh,ow,3]
+            # one 3x3 per shard: shard pixel = Ks R(s)^T world
+            M = self.Ks @ self.Rs[sel]                                          # [n,3,3]
+            p = torch.einsum("hwc,ndc->nhwd", world, M)                         # [n,oh,ow,3]
+            z = p[..., 2]
+            front = z > 1e-6
+            zs = torch.where(front, z, torch.ones_like(z))
+            grid = torch.stack([(p[..., 0] / zs) / self.sw * 2 - 1,
+                                (p[..., 1] / zs) / self.sh * 2 - 1], -1)
+            grid = torch.where(front[..., None], grid, torch.full_like(grid, 3.0))
+            tex = self.tex[sel]
+            samp = F.grid_sample(tex if tex.dtype == grid.dtype else tex.to(grid.dtype), grid,
+                                 mode="bilinear", padding_mode="zeros", align_corners=False)
+            for k in range(len(idx)):                                           # later shards win
+                a = samp[k, 3]
+                ok = a > 0.5
+                rgb = samp[k, :3] / a.clamp_min(1e-6)
+                out = torch.where(ok[None], rgb, out)
+                known |= ok
         if fill:
             out = push_pull_fill(out, known)
         return out.clamp(0, 1), known
@@ -228,6 +245,13 @@ def main():
             (rgb * 255 + 0.5).byte().permute(1, 2, 0).contiguous().cpu()
         sync()
         info["render_plus_download_fps"] = round(len(path) / (time.time() - t0), 1)
+        culled = [world.render(y, ow, oh)[0] for y in path[::40]]
+        vis = world.visible
+        world.visible = lambda *_: list(range(world.n))
+        full = [world.render(y, ow, oh)[0] for y in path[::40]]
+        world.visible = vis
+        info["cull_vs_all_shards_max_abs_diff_8bit"] = int(max(
+            ((a - b).abs().max() * 255).round() for a, b in zip(culled, full)))
         a, _ = world.render(path[0], ow, oh)
         b, _ = world.render(path[-1], ow, oh)
         info["loop_closure_max_abs_diff_8bit"] = int(((a - b).abs().max() * 255).round())
