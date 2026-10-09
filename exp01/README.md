@@ -37,8 +37,8 @@ The CPU renderer takes about 3 s per 1920x1072 frame.
   Shard 02 v1 broke this: the prompt asked for a desk wall where the runner rug
   continued, so the model laid the rug under a wall
   (`shards/rejected/shard02_raw_v1_rug_under_wall.png`).
-- **Resolution.** Upload the model output at full resolution. Shard 02 v1 came
-  back at 1024 px wide against 2752 px for earlier shards.
+- **Resolution.** Accepted shards are upscaled in Flow before upload (2752 px
+  wide). Rejected attempts are kept at the raw 1024 px output.
 
 ## Assumptions
 
