@@ -24,6 +24,11 @@ repainting it, so that a world built from shards stays consistent.
 |---|---|---|---|
 | 01 | 30 | 55% | No pixel shift. Colour PSNR 39 dB after blur, 23 dB raw: only fine texture was re-synthesised |
 
+Pan render 0 to 30 to 0 degrees: the first and last frames are bit-identical
+before video encoding (max difference 0), so loop closure holds by
+construction. Holes peak at 0.32% of a frame, all from the masked watermark.
+The CPU renderer takes about 3 s per 1920x1072 frame.
+
 ## Assumptions
 
 - 24mm lens on a 36mm-wide sensor, so a horizontal field of view of about 74 degrees.
