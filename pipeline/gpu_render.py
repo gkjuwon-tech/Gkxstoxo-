@@ -36,6 +36,18 @@ def yaw_matrix(deg):
     return torch.tensor([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=torch.float32)
 
 
+def pitch_matrix(deg):
+    """Rotation for a camera tilted up by `deg` (image y points down)."""
+    t = math.radians(deg)
+    c, s = math.cos(t), math.sin(t)
+    return torch.tensor([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=torch.float32)
+
+
+def cam_to_world(yaw, pitch=0.0):
+    """Camera pans about the world vertical, then tilts about its own x axis."""
+    return yaw_matrix(yaw) @ pitch_matrix(pitch)
+
+
 def push_pull_fill(rgb, valid, levels=8):
     """rgb: [3,H,W], valid: [H,W] bool. Fills invalid pixels from valid neighbours."""
     w = valid.float()[None, None]
@@ -57,15 +69,16 @@ def push_pull_fill(rgb, valid, levels=8):
 
 
 class ShardWorld:
-    def __init__(self, textures, yaws, focal_mm, device):
+    def __init__(self, textures, yaws, focal_mm, device, pitches=None):
         """textures: [N,4,H,W] float in 0..1 (alpha 1 = seen). Later shards win."""
+        pitches = pitches or [0.0] * len(yaws)
         self.device = device
         self.tex = textures.to(device)
         self.n, _, self.sh, self.sw = self.tex.shape
         self.Ks = intrinsics(self.sw, self.sh, focal_mm).to(device)
         # world -> shard camera for every shard: R(syaw)^T
-        self.Rs = torch.stack([yaw_matrix(y).T for y in yaws]).to(device)
-        self.yaws = list(yaws)
+        self.Rs = torch.stack([cam_to_world(y, p).T for y, p in zip(yaws, pitches)]).to(device)
+        self.fwd = [cam_to_world(y, p)[:, 2] for y, p in zip(yaws, pitches)]
         self.focal_mm = focal_mm
         self._rays = {}
 
@@ -82,26 +95,23 @@ class ShardWorld:
     def _half_diag(self, w, h, K):
         return math.atan(math.hypot(w, h) / 2 / float(K[0, 0]))
 
-    def visible(self, yaw, ow, oh):
-        """Indices of shards whose frustum can overlap a camera at `yaw` (pure yaw only)."""
+    def visible(self, yaw, ow, oh, pitch=0.0):
+        """Indices of shards whose frustum can overlap the camera (cone test on view axes)."""
         Ko = intrinsics(ow, oh, self.focal_mm)
         reach = self._half_diag(ow, oh, Ko) + self._half_diag(self.sw, self.sh, self.Ks.cpu())
-        out = []
-        for i, sy in enumerate(self.yaws):
-            d = abs((yaw - sy + 180.0) % 360.0 - 180.0)
-            if math.radians(d) < reach:
-                out.append(i)
-        return out
+        f = cam_to_world(yaw, pitch)[:, 2]
+        return [i for i, g in enumerate(self.fwd)
+                if math.acos(max(-1.0, min(1.0, float(f @ g)))) < reach]
 
     @torch.no_grad()
-    def render(self, yaw, ow, oh, fill=True):
+    def render(self, yaw, ow, oh, fill=True, pitch=0.0):
         """Returns ([3,oh,ow] float 0..1, [oh,ow] bool known)."""
-        idx = self.visible(yaw, ow, oh)
+        idx = self.visible(yaw, ow, oh, pitch)
         out = torch.zeros(3, oh, ow, device=self.device)
         known = torch.zeros(oh, ow, dtype=torch.bool, device=self.device)
         if idx:
             sel = torch.tensor(idx, device=self.device)
-            world = self.rays(ow, oh) @ yaw_matrix(yaw).to(self.device).T      # [oh,ow,3]
+            world = self.rays(ow, oh) @ cam_to_world(yaw, pitch).to(self.device).T  # [oh,ow,3]
             # one 3x3 per shard: shard pixel = Ks R(s)^T world
             M = self.Ks @ self.Rs[sel]                                          # [n,3,3]
             p = torch.einsum("hwc,ndc->nhwd", world, M)                         # [n,oh,ow,3]
@@ -147,11 +157,11 @@ def open_writer(path, ow, oh, fps):
                              "-pix_fmt", "yuv420p", "-crf", "16", path], stdin=subprocess.PIPE)
 
 
-def write_video(world, yaws, ow, oh, fps, path):
+def write_video(world, yaws, ow, oh, fps, path, pitch=0.0):
     proc = open_writer(path, ow, oh, fps)
     t0 = time.time()
     for y in yaws:
-        rgb, _ = world.render(y, ow, oh)
+        rgb, _ = world.render(y, ow, oh, pitch=pitch)
         proc.stdin.write((rgb * 255 + 0.5).byte().permute(1, 2, 0).contiguous().cpu().numpy().tobytes())
     proc.stdin.close()
     proc.wait()
@@ -161,14 +171,15 @@ def write_video(world, yaws, ow, oh, fps, path):
 def load_textures(specs):
     from PIL import Image
 
-    texs, yaws = [], []
+    texs, yaws, pitches = [], [], []
     for s in specs:
         im = np.asarray(Image.open(s["path"]).convert("RGBA")).astype(np.float32) / 255.0
         a = (im[..., 3:] > 0.5).astype(np.float32)
         im = np.concatenate([im[..., :3] * a, a], -1)  # premultiplied
         texs.append(torch.from_numpy(im).permute(2, 0, 1))
         yaws.append(float(s["yaw"]))
-    return torch.stack(texs), yaws
+        pitches.append(float(s.get("pitch", 0.0)))
+    return torch.stack(texs), yaws, pitches
 
 
 def synthetic_world(n, sw, sh, focal_mm, device):
@@ -193,19 +204,20 @@ def synthetic_world(n, sw, sh, focal_mm, device):
         a[:, int(sh * 0.9):int(sh * 0.95), int(sw * 0.94):int(sw * 0.98)] = 0  # fake watermark hole
         texs.append(torch.cat([rgb * a, a]).cpu())
         yaws.append(yaw)
-    return torch.stack(texs), yaws
+    return torch.stack(texs), yaws, [0.0] * n
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["render", "bench"])
-    ap.add_argument("--shards", help='render: JSON list of {"path":..., "yaw":...}')
+    ap.add_argument("--shards", help='render: JSON list of {"path":..., "yaw":..., "pitch":...}')
     ap.add_argument("--keys", default="[0, 360]", help="JSON yaw keyframes, eased between")
     ap.add_argument("--seconds-per-leg", type=float, default=6.0)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--width", type=int, default=1920)
     ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--focal-mm", type=float, default=24.0)
+    ap.add_argument("--pitch", type=float, default=0.0, help="camera pitch for the pan")
     ap.add_argument("--half", action="store_true", help="store textures in float16")
     ap.add_argument("--out", default="pan.mp4")
     args = ap.parse_args()
@@ -214,12 +226,12 @@ def main():
     info = {"device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu"}
 
     if args.mode == "render":
-        texs, yaws = load_textures(json.loads(args.shards))
+        texs, yaws, pitches = load_textures(json.loads(args.shards))
     else:
-        texs, yaws = synthetic_world(12, 2752, 1536, args.focal_mm, device)
+        texs, yaws, pitches = synthetic_world(12, 2752, 1536, args.focal_mm, device)
     if args.half:
         texs = texs.half()
-    world = ShardWorld(texs, yaws, args.focal_mm, device)
+    world = ShardWorld(texs, yaws, args.focal_mm, device, pitches)
     if args.half:
         world.tex = world.tex.half()
     ow, oh = args.width, args.height
@@ -261,7 +273,7 @@ def main():
         info["frames"] = len(path)
         info["resolution"] = f"{ow}x{oh}"
 
-    secs = write_video(world, path, ow, oh, args.fps, args.out)
+    secs = write_video(world, path, ow, oh, args.fps, args.out, args.pitch)
     info["video_total_fps_with_encode"] = round(len(path) / secs, 1)
     info["video"] = args.out
     print(json.dumps(info, indent=2))

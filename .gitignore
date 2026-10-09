@@ -1,4 +1,4 @@
 __pycache__/
 *.pyc
-exp01/renders/bench*/*.mp4
-exp01/renders/bench*/*.log
+pipeline/bench/*.mp4
+pipeline/bench/*.log
