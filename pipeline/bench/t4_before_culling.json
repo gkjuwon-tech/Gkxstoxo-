@@ -1,0 +1,13 @@
+{
+  "device": "Tesla T4",
+  "render_fps_fill_True": 16.0,
+  "render_fps_fill_False": 16.8,
+  "render_plus_download_fps": 15.3,
+  "loop_closure_max_abs_diff_8bit": 0,
+  "gpu_mem_peak_gb": 3.16,
+  "shards": 12,
+  "frames": 361,
+  "resolution": "1920x1080",
+  "video_total_fps_with_encode": 8.8,
+  "video": "/kaggle/working/bench_pan.mp4"
+}

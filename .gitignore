@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+pipeline/bench/*.mp4
+pipeline/bench/*.log
+exp02/renders/kaggle/*.log
